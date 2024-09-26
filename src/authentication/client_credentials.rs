@@ -139,6 +139,61 @@ impl ClientCredentialInterceptor {
             }),
         }
     }
+
+    /// Create a new [`ClientCredentialInterceptor`].
+    /// After creation the token is fetched immediately.
+    /// This can be used to fail fast if the token cannot be fetched.
+    ///
+    /// # Errors
+    /// Returns an error if the token cannot be fetched.
+    pub fn new_initialized(
+        credentials: ClientCredentials,
+        refresh_config: RefreshConfiguration,
+    ) -> Result<Self, CredentialRefreshError> {
+        let mut interceptor = Self::new(credentials, refresh_config);
+
+        interceptor.refresh_token()?;
+
+        Ok(interceptor)
+    }
+
+    fn refresh_token(&mut self) -> Result<TokenResponse, CredentialRefreshError> {
+        // Unwrap RWLock to propagate poison (writer panicked)
+        // Get write lock immediately to not spawn multiple token fetch threads
+        let mut state_write_guard = self.inner.state.write().unwrap();
+
+        let credentials = self.inner.credentials.clone();
+        let refresh_config = self.inner.refresh_config.clone();
+        let client = self.inner.client.clone();
+
+        let token_response = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(CredentialRefreshError::RuntimeError)
+                .map(|rt| {
+                    rt.block_on(async { get_token(&credentials, &refresh_config, &client).await })
+                })
+        });
+
+        let token_response = token_response
+            .join()
+            .map_err(|_e| CredentialRefreshError::JoinError)???;
+
+        *state_write_guard = Some(ClientCredentialInterceptorState {
+            token: token_response.access_token.clone(),
+            // Default 59 minutes
+            token_expiry: chrono::Utc::now()
+                + chrono::Duration::new(
+                    i64::try_from(token_response.expires_in.unwrap_or(3600 - 60))
+                        .unwrap_or(i64::MAX),
+                    0,
+                )
+                .unwrap_or(chrono::Duration::try_seconds(3600 - 60).unwrap()),
+        });
+        drop(state_write_guard);
+        Ok(token_response)
+    }
 }
 
 /// Get a new token from the token endpoint
@@ -146,7 +201,7 @@ async fn get_token(
     credentials: &ClientCredentials,
     refresh_config: &RefreshConfiguration,
     client: &reqwest::Client,
-) -> Result<TokenResponse, tonic::Status> {
+) -> Result<TokenResponse, CredentialRefreshError> {
     let ClientCredentials {
         client_id,
         client_secret,
@@ -192,8 +247,7 @@ async fn get_token(
                     return Err(CredentialRefreshError::ServerError {
                         code: auth_response.status().as_u16(),
                         body: auth_response.text().await.unwrap_or_default(),
-                    }
-                    .into());
+                    });
                 };
 
                 // Retryable error
@@ -213,8 +267,7 @@ async fn get_token(
                 return Err(CredentialRefreshError::NonRetryableError {
                     code: auth_response.status().as_u16(),
                     body: auth_response.text().await.unwrap_or_default(),
-                }
-                .into());
+                });
             }
         }
     };
@@ -250,42 +303,7 @@ impl Interceptor for ClientCredentialInterceptor {
             };
             drop(state_read_guard);
 
-            // Unwrap RWLock to propagate poison (writer panicked)
-            // Get write lock immediately to not spawn multiple token fetch threads
-            let mut state_write_guard = self.inner.state.write().unwrap();
-
-            let credentials = self.inner.credentials.clone();
-            let refresh_config = self.inner.refresh_config.clone();
-            let client = self.inner.client.clone();
-
-            let token_response = std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(CredentialRefreshError::RuntimeError)
-                    .map(|rt| {
-                        rt.block_on(async {
-                            get_token(&credentials, &refresh_config, &client).await
-                        })
-                    })
-            });
-
-            let token_response = token_response
-                .join()
-                .map_err(|_e| CredentialRefreshError::JoinError)???;
-
-            *state_write_guard = Some(ClientCredentialInterceptorState {
-                token: token_response.access_token.clone(),
-                // Default 59 minutes
-                token_expiry: chrono::Utc::now()
-                    + chrono::Duration::new(
-                        i64::try_from(token_response.expires_in.unwrap_or(3600 - 60))
-                            .unwrap_or(i64::MAX),
-                        0,
-                    )
-                    .unwrap_or(chrono::Duration::try_seconds(3600 - 60).unwrap()),
-            });
-            drop(state_write_guard);
+            let token_response = self.refresh_token()?;
 
             metadata.insert(
                 AUTHORIZATION.as_str(),
