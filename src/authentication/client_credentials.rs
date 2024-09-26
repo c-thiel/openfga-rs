@@ -37,6 +37,46 @@ impl From<CredentialRefreshError> for tonic::Status {
     }
 }
 
+#[derive(Debug)]
+/// gRPC `Interceptor` that authenticates with an `OAuth2` server using client credentials.
+///
+/// The interceptor fetches a new token from the token endpoint and attaches it to intercepted requests.
+/// The token is refreshed automatically 60 seconds before expiration. If the server token response does not contain the
+/// `expires_in` field, the token is assumed to expire in 3600 seconds.
+///
+/// The interceptor does not insert the access token if the intercepted call already has an `Authorization` header.
+///
+/// # Examples
+/// ```no_run
+/// use openfga_rs::open_fga_service_client::OpenFgaServiceClient;
+/// use openfga_rs::authentication::{ClientCredentialInterceptor, ClientCredentials, RefreshConfiguration};
+/// use tonic::transport::Endpoint;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let credentials = ClientCredentials {
+///        client_id: "my-client".to_string(),
+///        client_secret: "my-secret".to_string(),
+///        token_endpoint: "http://my.idp.example.com/my-tenant/oauth2/token".to_string(),
+///        extra_headers: Default::default(),
+///        extra_oauth_params: Default::default()
+///     };
+///     let refresh_config = RefreshConfiguration { ..Default::default() };
+///
+///     let interceptor = ClientCredentialInterceptor::new(credentials, refresh_config);
+///     let channel = Endpoint::from_static("http://[::1]:50051")
+///         .connect()
+///         .await
+///         .unwrap();
+///     let _client = OpenFgaServiceClient::with_interceptor(channel, interceptor);
+///
+///     println!("Connected to OpenFGA service");
+/// }
+/// ```
+pub struct ClientCredentialInterceptor {
+    inner: Arc<ClientCredentialIInterceptorInner>,
+}
+
 #[derive(veil::Redact, Clone)]
 /// Client credentials used to authenticate with an `OAuth2` server [RFC 6749]
 pub struct ClientCredentials {
@@ -56,13 +96,8 @@ pub struct ClientCredentials {
 
 #[derive(Debug, Default, Clone)]
 pub struct RefreshConfiguration {
-    max_retry: u32,
-    retry_interval: std::time::Duration,
-}
-
-#[derive(Debug)]
-pub struct ClientCredentialInterceptor {
-    inner: Arc<ClientCredentialIInterceptorInner>,
+    pub max_retry: u32,
+    pub retry_interval: std::time::Duration,
 }
 
 #[derive(Debug)]

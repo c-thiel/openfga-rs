@@ -18,7 +18,7 @@ use tonic::service::interceptor::Interceptor;
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let interceptor = BearerTokenInterceptor::new("my-token".to_string()).unwrap();
+///     let interceptor = BearerTokenInterceptor::new("my-token").unwrap();
 ///     let channel = Endpoint::from_static("http://[::1]:50051")
 ///         .connect()
 ///         .await
