@@ -37,7 +37,7 @@ impl From<CredentialRefreshError> for tonic::Status {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// gRPC `Interceptor` that authenticates with an `OAuth2` server using client credentials.
 ///
 /// The interceptor fetches a new token from the token endpoint and attaches it to intercepted requests.
