@@ -4,7 +4,8 @@
 mod bearer_token;
 mod client_credentials;
 
-pub use bearer_token::BearerTokenInterceptor;
+pub use bearer_token::{BearerLayer, BearerTokenInterceptor};
 pub use client_credentials::{
-    ClientCredentialInterceptor, ClientCredentials, CredentialRefreshError, RefreshConfiguration,
+    ClientCredentialInterceptor, ClientCredentialLayer, ClientCredentials, CredentialRefreshError,
+    RefreshConfiguration,
 };

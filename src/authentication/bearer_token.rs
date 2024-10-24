@@ -1,5 +1,8 @@
 //! Interceptors for the gRPC client to authenticate with `OpenFGA`.
+
 use http::header::AUTHORIZATION;
+use http::{HeaderValue, Request};
+use std::task::{Context, Poll};
 use tonic::service::interceptor::Interceptor;
 
 /// Create a simple gRPC `Interceptor` that attaches a given access token to any request
@@ -55,6 +58,36 @@ impl Interceptor for BearerTokenInterceptor {
             metadata.insert(AUTHORIZATION.as_str(), self.token.clone());
         }
         Ok(request)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BearerLayer<S> {
+    inner: S,
+    token: HeaderValue,
+}
+
+impl<S> BearerLayer<S> {
+    pub fn new(inner: S, token: HeaderValue) -> Self {
+        Self { inner, token }
+    }
+}
+
+impl<S, Req> tower::Service<http::Request<Req>> for BearerLayer<S>
+where
+    S: tower::Service<http::Request<Req>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Req>) -> Self::Future {
+        req.headers_mut().insert(AUTHORIZATION, self.token.clone());
+        self.inner.call(req)
     }
 }
 

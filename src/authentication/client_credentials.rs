@@ -1,11 +1,13 @@
 use http::{
     header::{ACCEPT, AUTHORIZATION},
-    HeaderMap,
+    HeaderMap, HeaderValue, Request,
 };
+use std::task::{Context, Poll};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
 };
+use tonic::codegen::BoxFuture;
 use tonic::service::interceptor::Interceptor;
 
 /// Refreshing openfga credentials failed.
@@ -77,6 +79,76 @@ pub struct ClientCredentialInterceptor {
     inner: Arc<ClientCredentialIInterceptorInner>,
 }
 
+/// A tower `Layer` that authenticates with an `OAuth2` server using client credentials.
+///
+/// The layer fetches a new token from the token endpoint and attaches it to intercepted requests.
+/// The token is refreshed automatically 60 seconds before expiration. If the server token response does not contain the
+/// `expires_in` field, the token is assumed to expire in 3600 seconds.
+///
+/// The layer does not insert the access token if the intercepted call already has an `Authorization` header.
+///
+/// # Examples
+///
+#[derive(Debug, Clone)]
+pub struct ClientCredentialLayer<S> {
+    inner: Arc<ClientCredentialIInterceptorInner>,
+    inner_service: S,
+}
+
+impl<S> ClientCredentialLayer<S> {
+    pub fn new(
+        credentials: ClientCredentials,
+        refresh_config: RefreshConfiguration,
+        inner_service: S,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ClientCredentialIInterceptorInner {
+                credentials,
+                refresh_config,
+                state: RwLock::new(None),
+                client: reqwest::Client::new(),
+            }),
+            inner_service,
+        }
+    }
+}
+
+impl<S, Req, Resp: 'static> tower::Service<http::Request<Req>> for ClientCredentialLayer<S>
+where
+    S: tower::Service<
+        Request<Req>,
+        Response = http::Response<Resp>,
+        Error = tonic::Status,
+        Future = BoxFuture<http::Response<Resp>, tonic::Status>,
+    >,
+{
+    type Response = http::Response<Resp>;
+    type Error = S::Error;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner_service.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Req>) -> Self::Future {
+        let metadata = req.headers_mut();
+        if !metadata.contains_key(AUTHORIZATION.as_str()) {
+            let token = match self.inner.get_or_refresh_token() {
+                Ok(token) => match format!("Bearer {token}").parse::<HeaderValue>() {
+                    Ok(token) => token,
+                    Err(e) => {
+                        return Box::pin(async move { Err(tonic::Status::internal(e.to_string())) })
+                    }
+                },
+                Err(e) => return Box::pin(async move { Err(e.into()) }),
+            };
+            metadata.insert(AUTHORIZATION.as_str(), token);
+        }
+
+        self.inner_service.call(req)
+    }
+}
+
 #[derive(veil::Redact, Clone)]
 /// Client credentials used to authenticate with an `OAuth2` server [RFC 6749]
 pub struct ClientCredentials {
@@ -123,6 +195,64 @@ pub(super) struct TokenResponse {
     pub(super) issued_token_type: Option<String>,
 }
 
+impl ClientCredentialIInterceptorInner {
+    fn get_or_refresh_token(&self) -> Result<String, CredentialRefreshError> {
+        let state_read_guard = self.state.read().expect("poisoned lock");
+
+        if let Some(ClientCredentialInterceptorState {
+            token,
+            token_expiry,
+        }) = &*state_read_guard
+        {
+            if token_expiry > &chrono::Utc::now() {
+                return Ok(token.clone());
+            }
+        };
+        drop(state_read_guard);
+
+        let token_response = self.refresh_token()?;
+        Ok(token_response.access_token)
+    }
+
+    fn refresh_token(&self) -> Result<TokenResponse, CredentialRefreshError> {
+        // Unwrap RWLock to propagate poison (writer panicked)
+        // Get write lock immediately to not spawn multiple token fetch threads
+        let mut state_write_guard = self.state.write().unwrap();
+
+        let credentials = self.credentials.clone();
+        let refresh_config = self.refresh_config.clone();
+        let client = self.client.clone();
+
+        let token_response = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(CredentialRefreshError::RuntimeError)
+                .map(|rt| {
+                    rt.block_on(async { get_token(&credentials, &refresh_config, &client).await })
+                })
+        });
+
+        let token_response = token_response
+            .join()
+            .map_err(|_e| CredentialRefreshError::JoinError)???;
+
+        *state_write_guard = Some(ClientCredentialInterceptorState {
+            token: token_response.access_token.clone(),
+            // Default 59 minutes
+            token_expiry: chrono::Utc::now()
+                + chrono::Duration::new(
+                    i64::try_from(token_response.expires_in.unwrap_or(3600 - 60))
+                        .unwrap_or(i64::MAX),
+                    0,
+                )
+                .unwrap_or(chrono::Duration::try_seconds(3600 - 60).unwrap()),
+        });
+        drop(state_write_guard);
+        Ok(token_response)
+    }
+}
+
 impl ClientCredentialInterceptor {
     /// Create a new [`ClientCredentialInterceptor`].
     /// The interceptor fetches a new token from the token endpoint
@@ -158,41 +288,7 @@ impl ClientCredentialInterceptor {
     }
 
     fn refresh_token(&mut self) -> Result<TokenResponse, CredentialRefreshError> {
-        // Unwrap RWLock to propagate poison (writer panicked)
-        // Get write lock immediately to not spawn multiple token fetch threads
-        let mut state_write_guard = self.inner.state.write().unwrap();
-
-        let credentials = self.inner.credentials.clone();
-        let refresh_config = self.inner.refresh_config.clone();
-        let client = self.inner.client.clone();
-
-        let token_response = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(CredentialRefreshError::RuntimeError)
-                .map(|rt| {
-                    rt.block_on(async { get_token(&credentials, &refresh_config, &client).await })
-                })
-        });
-
-        let token_response = token_response
-            .join()
-            .map_err(|_e| CredentialRefreshError::JoinError)???;
-
-        *state_write_guard = Some(ClientCredentialInterceptorState {
-            token: token_response.access_token.clone(),
-            // Default 59 minutes
-            token_expiry: chrono::Utc::now()
-                + chrono::Duration::new(
-                    i64::try_from(token_response.expires_in.unwrap_or(3600 - 60))
-                        .unwrap_or(i64::MAX),
-                    0,
-                )
-                .unwrap_or(chrono::Duration::try_seconds(3600 - 60).unwrap()),
-        });
-        drop(state_write_guard);
-        Ok(token_response)
+        self.inner.refresh_token()
     }
 }
 
@@ -282,36 +378,13 @@ impl Interceptor for ClientCredentialInterceptor {
     ) -> Result<tonic::Request<()>, tonic::Status> {
         let metadata = request.metadata_mut();
         if !metadata.contains_key(AUTHORIZATION.as_str()) {
-            // Unwrap RWLock to propagate poison (writer panicked)
-            let state_read_guard = self.inner.state.read().expect("poisoned lock");
-
-            if let Some(ClientCredentialInterceptorState {
-                token,
-                token_expiry,
-            }) = &*state_read_guard
-            {
-                if token_expiry > &chrono::Utc::now() {
-                    metadata.insert(
-                        AUTHORIZATION.as_str(),
-                        format!("Bearer {token}")
-                            .parse()
-                            .map_err(|_e| CredentialRefreshError::InvalidToken(token.clone()))?,
-                    );
-
-                    return Ok(request);
-                }
-            };
-            drop(state_read_guard);
-
-            let token_response = self.refresh_token()?;
+            let token_response = self.inner.get_or_refresh_token()?;
 
             metadata.insert(
                 AUTHORIZATION.as_str(),
-                format!("Bearer {}", token_response.access_token)
+                format!("Bearer {token_response}")
                     .parse()
-                    .map_err(|_e| {
-                        CredentialRefreshError::InvalidToken(token_response.access_token)
-                    })?,
+                    .map_err(|_e| CredentialRefreshError::InvalidToken(token_response))?,
             );
         }
 
