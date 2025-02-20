@@ -3,6 +3,5 @@
 
 pub use prost_types;
 pub use tonic;
-pub mod authentication;
 
 include!("gen/openfga.v1.rs");
